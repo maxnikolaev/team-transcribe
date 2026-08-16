@@ -1,0 +1,42 @@
+# ============================================================
+#  Team Transcribe — проекты и доступы
+#  Формат описан в README.md (раздел «Конфигурация проектов»).
+# ============================================================
+
+# --- Кто может обращаться к боту (Telegram user id) ---
+# tg_id — числовой id пользователя в Telegram.
+# Узнать свой id можно у @userinfobot.
+allowed_users:
+  - tg_id: 84225163
+    name: Макс
+    role: owner
+  - tg_id: 274335772
+    name: Александр
+    role: member
+
+# --- Проекты. folder — путь внутри целевого git-репозитория ---
+# language перекрывает DEEPGRAM_LANGUAGE из .env для этого проекта.
+# notify_chat — chat_id чата, куда слать уведомление о новом транскрипте
+#               (опционально; если не указан, берётся NOTIFY_CHAT_ID из .env).
+projects:
+  - id: ermitazh
+    name: Усадьба Эрмитаж
+    folder: "cases/2025-09-14 - земля - Усадьба Эрмитаж - 55 участков/"
+    language: ru
+    members:
+      - tg_id: 84225163
+        role: owner
+        can_create_folders: true
+      - tg_id: 274335772
+        role: member
+        can_create_folders: false
+    notify_chat: 562953535389958
+
+  - id: taksi
+    name: Таксопарк
+    folder: "cases/2026-07-20 - земля - Таксопарк/"
+    language: ru
+    members:
+      - tg_id: 84225163
+        role: owner
+        can_create_folders: true

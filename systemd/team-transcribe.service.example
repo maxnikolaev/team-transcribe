@@ -1,0 +1,21 @@
+# systemd user-юнит для Team Transcribe.
+# 1. Скопируй в ~/.config/systemd/user/team-transcribe.service
+# 2. systemctl --user daemon-reload
+# 3. systemctl --user enable --now team-transcribe
+# 4. Логи: journalctl --user -u team-transcribe -f
+
+[Unit]
+Description=Team Transcribe — Telegram bot (Deepgram transcription)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/PROJECTS/team-transcribe
+ExecStart=%h/PROJECTS/team-transcribe/.venv/bin/python -m transcribe
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=%h/PROJECTS/team-transcribe/.env
+
+[Install]
+WantedBy=default.target

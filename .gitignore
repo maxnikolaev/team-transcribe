@@ -1,0 +1,21 @@
+# Секреты — НИКОГДА не коммитим
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Runtime-артефакты
+downloads/
+tmp/
+*.log
+
+# ОС / редакторы
+.DS_Store
+.idea/
+.vscode/

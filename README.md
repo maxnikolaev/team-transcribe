@@ -1,0 +1,161 @@
+# Team Transcribe
+
+Telegram-бот, который транскрибирует разговоры команды и складывает их в
+папки проектов в git-репозитории.
+
+Кидаешь боту **голосовое или аудиофайл** (запись звонка, диктофон) +
+**комментарий с проектом** — бот транскрибирует через
+[Deepgram](https://deepgram.com), раскладывает транскрипт по папке проекта,
+коммитит в git и оповещает в чате.
+
+## Возможности
+
+- 🎙 Транскрибация через Deepgram `nova-3` (русский из коробки)
+- 👥 Разбивка по говорящим (diarization) — «кто что сказал»
+- 🗂 Автоматическая маршрутизация по проектам (по комментарию или уточняющим кнопкам)
+- 🔐 Список допущенных пользователей + права доступа к проектам
+- 🌳 Хранение в git-репозитории по правилам иерархии папок
+- 📝 Авто-коммиты с понятными сообщениями
+- 🔔 Уведомления в чат проекта / общий чат
+
+## Как это работает
+
+```
+Пользователь ──аудио + «Эрмитаж, звонок с подрядчиком»──▶ Telegram-бот
+   │
+   ├─ 1. Проверка доступа (allowed_users)
+   ├─ 2. Скачивание аудио
+   ├─ 3. Deepgram: транскрибация + диаризация
+   ├─ 4. Определение проекта (по тексту или кнопкам)
+   ├─ 5. Сохранение: <проект>/звонки/YYYY-MM-DD_HHmm_<кто>_<тема>.md (+.json +аудио)
+   ├─ 6. git pull --rebase → add → commit → push
+   └─ 7. Уведомление в чат
+```
+
+## Установка
+
+### 1. Клонировать
+
+```bash
+git clone https://github.com/maxnikolaev/team-transcribe.git
+cd team-transcribe
+```
+
+### 2. Завести бота и ключ Deepgram
+
+- **Telegram:** `t.me/BotFather` → `/newbot` → получить токен.
+- **Deepgram:** зарегистрироваться на [console.deepgram.com](https://console.deepgram.com)
+  → **API Keys** → создать ключ. При регистрации дают **$200 бесплатных кредитов**.
+
+### 3. Настроить окружение
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cp .env.example .env
+# заполни .env своими значениями
+```
+
+Минимально нужно заполнить в `.env`:
+
+```
+TELEGRAM_BOT_TOKEN=...
+DEEPGRAM_API_KEY=...
+GIT_REPO_URL=git@github.com:you/your-repo.git
+GIT_REPO_DIR=/путь/к/клону/your-repo
+GIT_AUTHOR_NAME=...
+GIT_AUTHOR_EMAIL=...
+```
+
+> Для приватных репозиториев git должен ходить по SSH — настрой
+> deploy-ключ (`ssh-keygen` → GitHub → Settings → Deploy keys).
+
+### 4. Настроить проекты и доступы
+
+Отредактируй `config/projects.yaml` — см. раздел «Конфигурация проектов».
+
+### 5. Запустить
+
+```bash
+.venv/bin/python -m transcribe
+```
+
+Либо как сервис (systemd, см. `systemd/team-transcribe.service.example`):
+
+```bash
+cp systemd/team-transcribe.service.example ~/.config/systemd/user/team-transcribe.service
+systemctl --user daemon-reload
+systemctl --user enable --now team-transcribe
+journalctl --user -u team-transcribe -f
+```
+
+## Конфигурация проектов (`config/projects.yaml`)
+
+```yaml
+# Кто может обращаться к боту
+allowed_users:
+  - tg_id: 84225163        # свой id можно узнать у @userinfobot
+    name: Макс
+    role: owner            # owner | member
+
+# Проекты
+projects:
+  - id: ermitazh
+    name: Усадьба Эрмитаж
+    folder: "cases/2025-09-14 - земля - Усадьба Эрмитаж/"
+    language: ru           # перекрывает DEEPGRAM_LANGUAGE
+    members:               # доступы участников
+      - tg_id: 84225163
+        role: owner
+        can_create_folders: true
+      - tg_id: 274335772
+        role: member
+        can_create_folders: false
+    notify_chat: 562953535389958   # чат для уведомлений (опционально)
+```
+
+**Правила доступов:**
+- Пользователь видит/трогает только проекты, где он в `members`.
+- `can_create_folders: false` — не может создавать новые проекты, только добавлять в существующие.
+- `role: owner` — полные права (в т.ч. создание новых проектов).
+
+## Правила именования и папок
+
+Транскрипты складываются в подпапку `звонки` (меняется через
+`TRANSCRIPTS_SUBFOLDER`) внутри папки проекта:
+
+```
+<repo>/<project.folder>/звонки/
+├── 2026-08-16_1430_max_zvonok-s-podryadchikom.md   # транскрипт (Markdown)
+├── 2026-08-16_1430_max_zvonok-s-podryadchikom.json  # сырой ответ Deepgram
+└── 2026-08-16_1430_max_zvonok-s-podryadchikom.ogg   # оригинал аудио (опц.)
+```
+
+Имя файла: `YYYY-MM-DD_HHmm_<кто>_<тема>` (время — MSK).
+
+## Переменные окружения (`.env`)
+
+| Переменная | Описание | По умолчанию |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | токен бота от BotFather | — |
+| `DEEPGRAM_API_KEY` | ключ Deepgram | — |
+| `DEEPGRAM_MODEL` | модель транскрибации | `nova-3` |
+| `DEEPGRAM_LANGUAGE` | язык по умолчанию | `ru` |
+| `DEEPGRAM_DIARIZE` | разбивка по говорящим | `true` |
+| `DEEPGRAM_SMART_FORMAT` | автоформатирование текста | `true` |
+| `GIT_REPO_URL` | целевой репозиторий | — |
+| `GIT_REPO_DIR` | локальный клон | — |
+| `GIT_BRANCH` | ветка | `main` |
+| `TRANSCRIPTS_SUBFOLDER` | подпапка транскриптов | `звонки` |
+| `SAVE_ORIGINAL_AUDIO` | сохранять оригинал аудио | `true` |
+| `NOTIFY_CHAT_ID` | глобальный чат уведомлений | — |
+
+## Требования
+
+- Python 3.10+
+- `ffmpeg` (для fallback-конвертации редких форматов)
+- git + доступ к целевому репозиторию
+
+## Лицензия
+
+MIT — см. [LICENSE](LICENSE).
