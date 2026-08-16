@@ -1,6 +1,6 @@
-"""Telegram-бот: принимает аудио + метаданные, транскрибирует, сохраняет в git.
+"""Telegram-бот: принимает аудио/видео/YouTube-ссылку, транскрибирует, сохраняет в git.
 
-Поток: аудио → проект → канал → участники → тема → транскрибация → .md в git.
+Поток: медиа → проект → канал → участники → тема → транскрибация → .md в git.
 Человек может прислать метаданные одним сообщением («телефон, Саша + Макс,
 обсуждение плана») — бот разделит, недостающее спросит.
 """
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
 from .config import get_settings
 from .deepgram_client import format_transcript, transcribe as transcribe_audio
 from .git_sync import commit_and_push
+from .media import download_youtube_audio, extract_audio
 from .metadata import CHANNEL_ALIASES, canonical_channel, parse_metadata, split_segments
 from .project_router import (accessible_projects, can_create_projects,
                              create_project, extract_topic, find_project)
@@ -32,6 +34,20 @@ router = Router()
 
 # Состояние ожидания: tg_id -> {audio_path, project_id, channel, participants, topic}
 _pending: dict[int, dict] = {}
+
+_YOUTUBE_RE = re.compile(
+    r"(?:https?://)?(?:www\.|m\.)?"
+    r"(?:youtube\.com/(?:watch\?v=|shorts/|embed/|live/)|youtu\.be/)[\w-]{6,}"
+)
+
+
+def extract_youtube_url(text: str) -> str | None:
+    m = _YOUTUBE_RE.search(text or "")
+    return m.group(0) if m else None
+
+
+def _cookies_path(tg_id: int) -> Path:
+    return Path("downloads") / str(tg_id) / "cookies.txt"
 
 
 def _allowed(tg_id: int) -> bool:
@@ -187,6 +203,42 @@ async def _process(bot: Bot, tg_id: int, p: dict) -> None:
     _pending.pop(tg_id, None)
 
 
+async def _start_processing(message: Message, audio_path: Path, meta_text: str) -> None:
+    """Общая точка входа: получили аудио → парсим метаданные → запускаем диалог."""
+    settings = get_settings()
+    tg_id = message.from_user.id
+
+    project = find_project(settings, tg_id, meta_text)
+    project_id = project.id if project else None
+    rest = extract_topic(meta_text, project) if project else meta_text
+    channel, participants, topic = parse_metadata(rest)
+
+    pending = _new_pending(str(audio_path))
+    pending["project_id"] = project_id
+    _fill(pending, channel, participants, topic)
+    _pending[tg_id] = pending
+    await _advance(message.bot, tg_id)
+
+
+async def _handle_youtube(message: Message, url: str, meta_text: str,
+                          cookies: Path | None) -> None:
+    settings = get_settings()
+    tg_id = message.from_user.id
+    status = await message.answer("⏬ Скачиваю аудио с YouTube…")
+    try:
+        audio = await asyncio.to_thread(
+            download_youtube_audio, url, Path("downloads") / str(tg_id), cookies
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("youtube download failed")
+        await status.edit_text(f"❌ Не удалось скачать: {e}")
+        return
+
+    await status.edit_text("✅ Аудио получено.")
+    rest = meta_text.replace(url, "", 1).strip()
+    await _start_processing(message, audio, rest)
+
+
 @router.message(CommandStart())
 async def on_start(message: Message):
     settings = get_settings()
@@ -197,10 +249,13 @@ async def on_start(message: Message):
     names = ", ".join(p.name for p in projects) or "—"
     await message.answer(
         "Привет! Я транскрибирую разговоры команды.\n\n"
-        "Кинь голосовое или аудиофайл + комментарий. "
+        "Принимаю:\n"
+        "• голосовое / аудиофайл\n"
+        "• видеофайл (MP4) — извлеку звук\n"
+        "• ссылку на YouTube — скачаю аудио\n\n"
         "Можно сразу всё одним сообщением:\n"
-        "«Эрмитаж, телефон, Саша + Макс, обсуждение плана»\n\n"
-        "Чего не хватит — спрошу отдельно.\n"
+        "«Эрмитаж, телефон, Саша + Макс, обсуждение плана»\n"
+        "Чего не хватит — спрошу отдельно.\n\n"
         f"Доступные проекты: {names}\n"
         "/projects — список · /help — справка"
     )
@@ -224,11 +279,16 @@ async def on_help(message: Message):
     if not _allowed(message.from_user.id):
         return
     await message.answer(
-        "Отправь голосовое или аудиофайл.\n"
+        "Что можно прислать:\n"
+        "• голосовое или аудиофайл\n"
+        "• видеофайл (MP4) — бот извлечёт звук\n"
+        "• ссылку на YouTube (текстом) — бот скачает аудио\n\n"
+        "Для YouTube с защитой: пришли cookies.txt файлом\n"
+        "(файл .txt, затем ссылку — либо файл с подписью-ссылкой).\n\n"
         "В подписи можно указать всё сразу:\n"
-        "«проект, канал, участники, тема»\n\n"
+        "«проект, канал, участники, тема»\n"
         "Пример: «Эрмитаж, телефон, Саша + Макс, обсуждение плана»\n\n"
-        "Недостающее бот спросит. Транскрипт сохранится как:\n"
+        "Транскрипт сохранится как:\n"
         "2026 - 07 20 - телефон - Саша + Макс - обсуждение плана.md"
     )
 
@@ -241,17 +301,6 @@ async def on_audio(message: Message):
         log.warning("denied audio from %s", tg_id)
         return
 
-    caption = message.caption or ""
-
-    # Проект из подписи
-    project = find_project(settings, tg_id, caption)
-    project_id = project.id if project else None
-
-    # Метаданные из подписи (канал, участники, тема)
-    rest = extract_topic(caption, project) if project else caption
-    channel, participants, topic = parse_metadata(rest)
-
-    # Скачиваем один раз
     file_id = message.voice.file_id if message.voice else message.audio.file_id
     dldir = Path("downloads") / str(tg_id)
     dldir.mkdir(parents=True, exist_ok=True)
@@ -263,11 +312,62 @@ async def on_audio(message: Message):
         await message.answer(f"❌ Не смог скачать файл: {e}")
         return
 
-    pending = _new_pending(str(dest))
-    pending["project_id"] = project_id
-    _fill(pending, channel, participants, topic)
-    _pending[tg_id] = pending
-    await _advance(message.bot, tg_id)
+    await _start_processing(message, dest, message.caption or "")
+
+
+@router.message(F.video)
+async def on_video(message: Message):
+    settings = get_settings()
+    tg_id = message.from_user.id
+    if not _allowed(tg_id):
+        log.warning("denied video from %s", tg_id)
+        return
+
+    dldir = Path("downloads") / str(tg_id)
+    dldir.mkdir(parents=True, exist_ok=True)
+    dest = dldir / f"{int(time.time())}.mp4"
+    try:
+        await _download(message.bot, message.video.file_id, dest)
+        audio = dldir / f"{int(time.time())}.wav"
+        await asyncio.to_thread(extract_audio, dest, audio)
+    except Exception as e:  # noqa: BLE001
+        log.exception("video extract failed")
+        await message.answer(f"❌ Не удалось извлечь аудио из видео: {e}")
+        return
+
+    await _start_processing(message, audio, message.caption or "")
+
+
+@router.message(F.document)
+async def on_document(message: Message):
+    settings = get_settings()
+    tg_id = message.from_user.id
+    if not _allowed(tg_id):
+        return
+
+    doc = message.document
+    name = (doc.file_name or "").lower()
+    # Принимаем только cookies-файлы (.txt или имя содержит cookie)
+    if not (name.endswith(".txt") or "cookie" in name):
+        await message.answer("Пришли cookies-файл в формате .txt (Netscape cookies).")
+        return
+
+    cookies_dir = Path("downloads") / str(tg_id)
+    cookies_dir.mkdir(parents=True, exist_ok=True)
+    cookies_path = cookies_dir / "cookies.txt"
+    try:
+        await _download(message.bot, doc.file_id, cookies_path)
+    except Exception as e:  # noqa: BLE001
+        log.exception("cookies download failed")
+        await message.answer(f"❌ Не смог скачать cookies: {e}")
+        return
+
+    caption = message.caption or ""
+    url = extract_youtube_url(caption)
+    if url:
+        await _handle_youtube(message, url, caption, cookies_path)
+    else:
+        await message.answer("Cookies сохранены ✓. Теперь кинь ссылку на YouTube.")
 
 
 @router.callback_query(F.data.startswith("proj:"))
@@ -329,12 +429,20 @@ async def on_text(message: Message):
     if not _allowed(tg_id):
         return
 
-    pending = _pending.get(tg_id)
-    if not pending:
-        await message.answer("Пришли голосовое/аудиофайл, а детали — подписью или ответом.")
+    text = message.text.strip()
+
+    # Ссылка на YouTube → новая задача
+    url = extract_youtube_url(text)
+    if url:
+        cookies = _cookies_path(tg_id)
+        cookies = cookies if cookies.exists() else None
+        await _handle_youtube(message, url, text, cookies)
         return
 
-    text = message.text.strip()
+    pending = _pending.get(tg_id)
+    if not pending:
+        await message.answer("Пришли голосовое/аудио/видео или ссылку на YouTube.")
+        return
 
     # Ожидание имени нового проекта
     if pending.get("_await_new_name"):
@@ -365,11 +473,9 @@ async def on_text(message: Message):
     elif missing in ("channel", "participants", "topic"):
         segs = split_segments(text)
         if len(segs) >= 2:
-            # «всё одним сообщением»
             ch, part, top = parse_metadata(text)
             _fill(pending, ch, part, top)
         else:
-            # ответ на конкретный вопрос
             if missing == "channel":
                 pending["channel"] = canonical_channel(text) or text
             elif missing == "participants":
