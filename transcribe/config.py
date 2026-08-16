@@ -120,7 +120,7 @@ def load_settings() -> Settings:
         git_branch=_env("GIT_BRANCH", "main"),
         git_author_name=_env("GIT_AUTHOR_NAME"),
         git_author_email=_env("GIT_AUTHOR_EMAIL"),
-        transcripts_subfolder=_env("TRANSCRIPTS_SUBFOLDER", "звонки"),
+        transcripts_subfolder=_env("TRANSCRIPTS_SUBFOLDER", "транскрибации"),
         save_original_audio=_env_bool("SAVE_ORIGINAL_AUDIO", True),
         notify_chat_id=int(nc) if nc else None,
         allowed_users=users,

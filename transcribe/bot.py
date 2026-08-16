@@ -1,4 +1,9 @@
-"""Telegram-бот: принимает аудио + комментарий, транскрибирует, сохраняет в git."""
+"""Telegram-бот: принимает аудио + метаданные, транскрибирует, сохраняет в git.
+
+Поток: аудио → проект → канал → участники → тема → транскрибация → .md в git.
+Человек может прислать метаданные одним сообщением («телефон, Саша + Макс,
+обсуждение плана») — бот разделит, недостающее спросит.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -16,21 +21,47 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
 from .config import get_settings
 from .deepgram_client import format_transcript, transcribe as transcribe_audio
 from .git_sync import commit_and_push
+from .metadata import CHANNEL_ALIASES, canonical_channel, parse_metadata, split_segments
 from .project_router import (accessible_projects, can_create_projects,
-                             create_project, extract_topic, find_project,
-                             sender_name)
+                             create_project, extract_topic, find_project)
 from .storage import save_transcript
 
 log = logging.getLogger("team-transcribe")
 
 router = Router()
 
-# Ожидание выбора проекта: tg_id -> {"audio_path", "topic", "awaiting_new_name"}
+# Состояние ожидания: tg_id -> {audio_path, project_id, channel, participants, topic}
 _pending: dict[int, dict] = {}
 
 
 def _allowed(tg_id: int) -> bool:
     return get_settings().user(tg_id) is not None
+
+
+def _new_pending(audio_path: str) -> dict:
+    return {"audio_path": audio_path, "project_id": None, "channel": None,
+            "participants": None, "topic": None}
+
+
+def _next_missing(p: dict) -> str | None:
+    if p["project_id"] is None:
+        return "project"
+    if not p["channel"]:
+        return "channel"
+    if not p["participants"]:
+        return "participants"
+    if not p["topic"]:
+        return "topic"
+    return None
+
+
+def _fill(p: dict, channel, participants, topic) -> None:
+    if channel and not p["channel"]:
+        p["channel"] = channel
+    if participants and not p["participants"]:
+        p["participants"] = participants
+    if topic and not p["topic"]:
+        p["topic"] = topic
 
 
 def _projects_keyboard(settings, tg_id: int) -> InlineKeyboardMarkup:
@@ -41,6 +72,12 @@ def _projects_keyboard(settings, tg_id: int) -> InlineKeyboardMarkup:
     if can_create_projects(settings, tg_id):
         rows.append([InlineKeyboardButton(text="➕ Новый проект", callback_data="proj:__new__")])
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="proj:__cancel__")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _channels_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=c, callback_data=f"chan:{c}")]
+            for c in CHANNEL_ALIASES]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -66,16 +103,43 @@ async def _download(bot: Bot, file_id: str, dest: Path) -> Path:
     return dest
 
 
-async def _process(bot: Bot, tg_id: int, audio_path: Path, project, topic: str) -> None:
+async def _advance(bot: Bot, tg_id: int) -> None:
     settings = get_settings()
-    name = sender_name(settings, tg_id)
+    p = _pending.get(tg_id)
+    if not p:
+        return
+
+    missing = _next_missing(p)
+    if missing == "project":
+        await bot.send_message(tg_id, "К какому проекту относится?",
+                               reply_markup=_projects_keyboard(settings, tg_id))
+    elif missing == "channel":
+        await bot.send_message(tg_id, "В каком канале был разговор?",
+                               reply_markup=_channels_keyboard())
+    elif missing == "participants":
+        await bot.send_message(tg_id, "Кто с кем разговаривал? (например: Саша + Макс)")
+    elif missing == "topic":
+        await bot.send_message(tg_id, "Какая тема? (например: обсуждение плана)")
+    else:
+        await _process(bot, tg_id, p)
+
+
+async def _process(bot: Bot, tg_id: int, p: dict) -> None:
+    settings = get_settings()
+    project = settings.project_by_id(p["project_id"])
+    if project is None:
+        await bot.send_message(tg_id, "Проект не найден.")
+        return
+
+    channel, participants, topic = p["channel"], p["participants"], p["topic"]
+    audio = Path(p["audio_path"])
 
     status = await bot.send_message(tg_id, f"⏳ Транскрибирую… ({project.name})")
 
     # 1) Транскрибация
     try:
         result = await asyncio.to_thread(
-            transcribe_audio, audio_path, settings.deepgram_api_key,
+            transcribe_audio, audio, settings.deepgram_api_key,
             settings.deepgram_model, project.language or settings.deepgram_language,
             settings.deepgram_diarize, settings.deepgram_smart_format,
         )
@@ -85,10 +149,10 @@ async def _process(bot: Bot, tg_id: int, audio_path: Path, project, topic: str) 
         await status.edit_text(f"❌ Ошибка транскрибации: {e}")
         return
 
-    # 2) Сохранение файлов
+    # 2) Сохранение (только .md)
     try:
         saved = await asyncio.to_thread(
-            save_transcript, settings, project, audio_path, markdown, result, name, topic
+            save_transcript, settings, project, markdown, channel, participants, topic
         )
     except Exception as e:  # noqa: BLE001
         log.exception("save failed")
@@ -103,7 +167,7 @@ async def _process(bot: Bot, tg_id: int, audio_path: Path, project, topic: str) 
             settings.git_author_name, settings.git_author_email,
         )
         await status.edit_text(
-            f"✅ Готово: <code>{saved['rel_folder']}</code>\nCommit: <code>{commit}</code>"
+            f"✅ Готово: <code>{saved['filename']}</code>\nCommit: <code>{commit}</code>"
         )
     except Exception as e:  # noqa: BLE001
         log.exception("git failed")
@@ -115,10 +179,12 @@ async def _process(bot: Bot, tg_id: int, audio_path: Path, project, topic: str) 
         try:
             await bot.send_message(
                 notify,
-                f"📝 {project.name}: новый транскрипт «{topic}» от {name}"
+                f"📝 {project.name}: «{topic}» ({channel}, {participants})"
             )
         except Exception as e:  # noqa: BLE001
             log.warning("notify failed: %s", e)
+
+    _pending.pop(tg_id, None)
 
 
 @router.message(CommandStart())
@@ -131,8 +197,10 @@ async def on_start(message: Message):
     names = ", ".join(p.name for p in projects) or "—"
     await message.answer(
         "Привет! Я транскрибирую разговоры команды.\n\n"
-        "Кинь голосовое или аудиофайл + комментарий, к какому проекту относится. "
-        "Например: «Эрмитаж, звонок с подрядчиком по сметам».\n\n"
+        "Кинь голосовое или аудиофайл + комментарий. "
+        "Можно сразу всё одним сообщением:\n"
+        "«Эрмитаж, телефон, Саша + Макс, обсуждение плана»\n\n"
+        "Чего не хватит — спрошу отдельно.\n"
         f"Доступные проекты: {names}\n"
         "/projects — список · /help — справка"
     )
@@ -156,11 +224,12 @@ async def on_help(message: Message):
     if not _allowed(message.from_user.id):
         return
     await message.answer(
-        "Отправь голосовое сообщение или аудиофайл.\n"
-        "Если в подписи укажешь проект — сохраню сразу, иначе спрошу куда.\n\n"
-        "Пример подписи: «Эрмитаж, созвон с подрядчиком»\n\n"
-        "Транскрипты сохраняются в папке проекта в git-репозитории "
-        "и помечаются в общем чате."
+        "Отправь голосовое или аудиофайл.\n"
+        "В подписи можно указать всё сразу:\n"
+        "«проект, канал, участники, тема»\n\n"
+        "Пример: «Эрмитаж, телефон, Саша + Макс, обсуждение плана»\n\n"
+        "Недостающее бот спросит. Транскрипт сохранится как:\n"
+        "2026 - 07 20 - телефон - Саша + Макс - обсуждение плана.md"
     )
 
 
@@ -173,9 +242,16 @@ async def on_audio(message: Message):
         return
 
     caption = message.caption or ""
-    project = find_project(settings, tg_id, caption)
 
-    # Скачиваем один раз, до возможного уточнения проекта
+    # Проект из подписи
+    project = find_project(settings, tg_id, caption)
+    project_id = project.id if project else None
+
+    # Метаданные из подписи (канал, участники, тема)
+    rest = extract_topic(caption, project) if project else caption
+    channel, participants, topic = parse_metadata(rest)
+
+    # Скачиваем один раз
     file_id = message.voice.file_id if message.voice else message.audio.file_id
     dldir = Path("downloads") / str(tg_id)
     dldir.mkdir(parents=True, exist_ok=True)
@@ -187,15 +263,11 @@ async def on_audio(message: Message):
         await message.answer(f"❌ Не смог скачать файл: {e}")
         return
 
-    if project is not None:
-        topic = extract_topic(caption, project)
-        await _process(message.bot, tg_id, dest, project, topic)
-        return
-
-    # Проект не определён однозначно — уточняем
-    text = "К какому проекту относится?" if not caption.strip() else "Не понял проект из подписи — выбери:"
-    await message.answer(text, reply_markup=_projects_keyboard(settings, tg_id))
-    _pending[tg_id] = {"audio_path": str(dest), "topic": caption}
+    pending = _new_pending(str(dest))
+    pending["project_id"] = project_id
+    _fill(pending, channel, participants, topic)
+    _pending[tg_id] = pending
+    await _advance(message.bot, tg_id)
 
 
 @router.callback_query(F.data.startswith("proj:"))
@@ -207,9 +279,10 @@ async def on_project_choice(cb: CallbackQuery):
         return
 
     data = cb.data.split(":", 1)[1]
-    pending = _pending.pop(tg_id, None)
+    pending = _pending.get(tg_id)
 
     if data == "__cancel__":
+        _pending.pop(tg_id, None)
         await cb.message.edit_text("Отменено.")
         return
     if pending is None:
@@ -217,7 +290,7 @@ async def on_project_choice(cb: CallbackQuery):
         return
 
     if data == "__new__":
-        _pending[tg_id] = {**pending, "awaiting_new_name": True}
+        pending["_await_new_name"] = True
         await cb.message.edit_text("Как назовём проект? Пришли название текстом.")
         return
 
@@ -229,9 +302,24 @@ async def on_project_choice(cb: CallbackQuery):
         await cb.message.edit_text("Нет доступа к этому проекту.")
         return
 
-    topic = extract_topic(pending.get("topic", ""), project)
-    await cb.message.edit_text(f"Обрабатываю «{topic}» → {project.name}…")
-    await _process(cb.bot, tg_id, Path(pending["audio_path"]), project, topic)
+    pending["project_id"] = data
+    await cb.message.edit_text(f"Проект: {project.name}")
+    await _advance(cb.bot, tg_id)
+
+
+@router.callback_query(F.data.startswith("chan:"))
+async def on_channel_choice(cb: CallbackQuery):
+    await cb.answer()
+    tg_id = cb.from_user.id
+    pending = _pending.get(tg_id)
+    if not pending:
+        await cb.message.edit_text("Нечего обрабатывать.")
+        return
+
+    channel = cb.data.split(":", 1)[1]
+    pending["channel"] = channel
+    await cb.message.edit_text(f"Канал: {channel}")
+    await _advance(cb.bot, tg_id)
 
 
 @router.message(F.text)
@@ -242,19 +330,54 @@ async def on_text(message: Message):
         return
 
     pending = _pending.get(tg_id)
-    if pending and pending.get("awaiting_new_name"):
-        name = message.text.strip()
+    if not pending:
+        await message.answer("Пришли голосовое/аудиофайл, а детали — подписью или ответом.")
+        return
+
+    text = message.text.strip()
+
+    # Ожидание имени нового проекта
+    if pending.get("_await_new_name"):
+        pending.pop("_await_new_name", None)
         _pending.pop(tg_id, None)
-        project = create_project(settings, tg_id, name)
+        project = create_project(settings, tg_id, text)
         if project is None:
             await message.answer("Не могу создать проект — нет прав.")
             return
-        topic = extract_topic(pending.get("topic", ""), None)
-        await message.answer(f"Создаю проект «{name}»…")
-        await _process(message.bot, tg_id, Path(pending["audio_path"]), project, topic)
+        pending["project_id"] = project.id
+        _pending[tg_id] = pending
+        await message.answer(f"Создан проект «{project.name}».")
+        await _advance(message.bot, tg_id)
         return
 
-    await message.answer("Пришли голосовое/аудиофайл. Проект можно указать в подписи.")
+    missing = _next_missing(pending)
+
+    if missing == "project":
+        proj = find_project(settings, tg_id, text)
+        if proj:
+            pending["project_id"] = proj.id
+            rest = extract_topic(text, proj)
+            if len(split_segments(rest)) >= 2:
+                ch, part, top = parse_metadata(rest)
+                _fill(pending, ch, part, top)
+        # если проект не распознан — _advance переспросит
+
+    elif missing in ("channel", "participants", "topic"):
+        segs = split_segments(text)
+        if len(segs) >= 2:
+            # «всё одним сообщением»
+            ch, part, top = parse_metadata(text)
+            _fill(pending, ch, part, top)
+        else:
+            # ответ на конкретный вопрос
+            if missing == "channel":
+                pending["channel"] = canonical_channel(text) or text
+            elif missing == "participants":
+                pending["participants"] = text
+            else:
+                pending["topic"] = text
+
+    await _advance(message.bot, tg_id)
 
 
 async def main():
