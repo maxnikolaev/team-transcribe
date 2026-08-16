@@ -18,6 +18,9 @@ downloads/
 tmp/
 *.log
 
+# Cookies для YouTube — только на сервере, НИКОГДА не коммитим
+.cookies/
+
 # ОС / редакторы
 .DS_Store
 .idea/

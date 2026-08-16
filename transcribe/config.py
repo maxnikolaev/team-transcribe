@@ -63,6 +63,7 @@ class Settings:
     transcripts_subfolder: str = "звонки"
     save_original_audio: bool = True
     notify_chat_id: int | None = None
+    cookies_path: Path = BASE_DIR / ".cookies" / "cookies.txt"
     allowed_users: list[User] = field(default_factory=list)
     projects: list[Project] = field(default_factory=list)
     config_path: Path = BASE_DIR / "config" / "projects.yaml"
@@ -123,6 +124,7 @@ def load_settings() -> Settings:
         transcripts_subfolder=_env("TRANSCRIPTS_SUBFOLDER", "транскрибации"),
         save_original_audio=_env_bool("SAVE_ORIGINAL_AUDIO", True),
         notify_chat_id=int(nc) if nc else None,
+        cookies_path=Path(os.getenv("COOKIES_PATH", "") or (BASE_DIR / ".cookies" / "cookies.txt")),
         allowed_users=users,
         projects=projects,
         config_path=config_path,

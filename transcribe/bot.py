@@ -46,8 +46,36 @@ def extract_youtube_url(text: str) -> str | None:
     return m.group(0) if m else None
 
 
-def _cookies_path(tg_id: int) -> Path:
-    return Path("downloads") / str(tg_id) / "cookies.txt"
+def _shared_cookies() -> Path | None:
+    """Общий серверный cookies-файл (если есть). None — если файла нет."""
+    p = get_settings().cookies_path
+    return p if p.exists() else None
+
+
+_BOT_CHECK_RE = re.compile(
+    r"(sign in to confirm|confirm you'?re not a bot|not a bot|requires login|"
+    r"please log in|sign in|http error 429|cookies)", re.IGNORECASE,
+)
+
+
+def _needs_cookies(err: str) -> bool:
+    """True, если ошибка похожа на «YouTube требует авторизацию / cookies протухли»."""
+    return bool(_BOT_CHECK_RE.search(err or ""))
+
+
+def _looks_like_cookies(path: Path) -> bool:
+    """Минимальная проверка: Netscape cookies — строки с 7 колонками через таб."""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return False
+    for ln in lines[:50]:
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        if "\t" in ln and len(ln.split("\t")) >= 7:
+            return True
+    return False
 
 
 def _allowed(tg_id: int) -> bool:
@@ -231,7 +259,15 @@ async def _handle_youtube(message: Message, url: str, meta_text: str,
         )
     except Exception as e:  # noqa: BLE001
         log.exception("youtube download failed")
-        await status.edit_text(f"❌ Не удалось скачать: {e}")
+        if _needs_cookies(str(e)):
+            await status.edit_text(
+                "❌ YouTube не отдаёт аудио без авторизации — cookies протухли "
+                "или их нет.\n\nПришли новый файл cookies.txt (Netscape-формат, "
+                "экспорт «Get cookies.txt LOCALLY»). Первый рабочий файл — "
+                "побеждает, и я использую его до следующего сбоя."
+            )
+        else:
+            await status.edit_text(f"❌ Не удалось скачать: {e}")
         return
 
     await status.edit_text("✅ Аудио получено.")
@@ -352,22 +388,30 @@ async def on_document(message: Message):
         await message.answer("Пришли cookies-файл в формате .txt (Netscape cookies).")
         return
 
-    cookies_dir = Path("downloads") / str(tg_id)
-    cookies_dir.mkdir(parents=True, exist_ok=True)
-    cookies_path = cookies_dir / "cookies.txt"
+    cookies_path = settings.cookies_path
+    cookies_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         await _download(message.bot, doc.file_id, cookies_path)
+        cookies_path.chmod(0o600)
     except Exception as e:  # noqa: BLE001
         log.exception("cookies download failed")
         await message.answer(f"❌ Не смог скачать cookies: {e}")
         return
 
+    if not _looks_like_cookies(cookies_path):
+        await message.answer(
+            "❌ Это не похоже на cookies.txt (Netscape). Нужен экспорт расширением "
+            "«Get cookies.txt LOCALLY»."
+        )
+        return
+
     caption = message.caption or ""
     url = extract_youtube_url(caption)
     if url:
+        await message.answer("Cookies обновлены ✓. Пробую скачать YouTube…")
         await _handle_youtube(message, url, caption, cookies_path)
     else:
-        await message.answer("Cookies сохранены ✓. Теперь кинь ссылку на YouTube.")
+        await message.answer("Cookies обновлены ✓. Теперь кинь ссылку на YouTube.")
 
 
 @router.callback_query(F.data.startswith("proj:"))
@@ -434,9 +478,7 @@ async def on_text(message: Message):
     # Ссылка на YouTube → новая задача
     url = extract_youtube_url(text)
     if url:
-        cookies = _cookies_path(tg_id)
-        cookies = cookies if cookies.exists() else None
-        await _handle_youtube(message, url, text, cookies)
+        await _handle_youtube(message, url, text, _shared_cookies())
         return
 
     pending = _pending.get(tg_id)
