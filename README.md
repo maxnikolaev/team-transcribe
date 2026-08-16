@@ -72,7 +72,13 @@ GIT_AUTHOR_EMAIL=...
 
 ### 4. Настроить проекты и доступы
 
-Отредактируй `config/projects.yaml` — см. раздел «Конфигурация проектов».
+```bash
+cp config/projects.example.yaml config/projects.yaml
+# заполни config/projects.yaml своими данными
+```
+
+> `config/projects.yaml` не коммитится (в `.gitignore`) — это конфиг с
+> реальными Telegram ID команды, он живёт только на сервере.
 
 ### 5. Запустить
 
@@ -90,6 +96,8 @@ journalctl --user -u team-transcribe -f
 ```
 
 ## Конфигурация проектов (`config/projects.yaml`)
+
+Скопируй пример: `cp config/projects.example.yaml config/projects.yaml`.
 
 ```yaml
 # Кто может обращаться к боту
