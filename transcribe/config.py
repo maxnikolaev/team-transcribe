@@ -38,6 +38,7 @@ class Project:
     language: str = ""
     members: list[dict] = field(default_factory=list)
     notify_chat: int | None = None
+    aliases: list[str] = field(default_factory=list)
 
     def member(self, tg_id: int) -> dict | None:
         for m in self.members:
@@ -102,6 +103,7 @@ def load_settings() -> Settings:
                 language=p.get("language", "") or _env("DEEPGRAM_LANGUAGE", "ru"),
                 members=p.get("members", []),
                 notify_chat=p.get("notify_chat"),
+                aliases=[str(a) for a in p.get("aliases", [])],
             )
         )
 
@@ -140,6 +142,7 @@ def persist_project(settings: Settings, project: Project) -> None:
             "folder": project.folder,
             "language": project.language,
             "members": project.members,
+            "aliases": project.aliases,
         }
     )
     settings.config_path.write_text(

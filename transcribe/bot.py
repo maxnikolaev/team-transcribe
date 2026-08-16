@@ -103,7 +103,7 @@ async def _process(bot: Bot, tg_id: int, audio_path: Path, project, topic: str) 
             settings.git_author_name, settings.git_author_email,
         )
         await status.edit_text(
-            f"✅ Готово: `{saved['rel_folder']}`\nCommit: `{commit}`"
+            f"✅ Готово: <code>{saved['rel_folder']}</code>\nCommit: <code>{commit}</code>"
         )
     except Exception as e:  # noqa: BLE001
         log.exception("git failed")

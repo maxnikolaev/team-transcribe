@@ -25,13 +25,21 @@ def can_create_projects(settings: Settings, tg_id: int) -> bool:
 def find_project(settings: Settings, tg_id: int, text: str) -> Project | None:
     """Ищет проект по упоминанию в тексте среди доступных пользователю.
 
-    Возвращает проект, только если совпадение единственное. Иначе None
-    (бот уточнит у пользователя).
+    Матчится по id, полному имени, алиасам, а также по отдельным словам
+    имени (>=3 символа) — чтобы «Эрмитаж» находил «Усадьбу Эрмитаж».
+    Возвращает проект только при единственном совпадении, иначе None.
     """
     t = text.lower()
     matches = []
     for p in accessible_projects(settings, tg_id):
         if p.id.lower() in t or p.name.lower() in t:
+            matches.append(p)
+            continue
+        if any(a.lower() in t for a in p.aliases):
+            matches.append(p)
+            continue
+        words = [w for w in re.findall(r"[a-zа-яё0-9]+", p.name.lower()) if len(w) >= 3]
+        if any(w in t for w in words):
             matches.append(p)
     return matches[0] if len(matches) == 1 else None
 
@@ -41,8 +49,10 @@ def extract_topic(text: str, project: Project | None) -> str:
     if not project:
         return text.strip() or "bez-temy"
     t = text
-    for token in (project.name, project.id):
-        t = re.sub(re.escape(token), "", t, flags=re.IGNORECASE)
+    tokens = [project.name, project.id] + list(project.aliases)
+    tokens += [w for w in re.findall(r"[a-zа-яё0-9]+", project.name.lower()) if len(w) >= 3]
+    for tok in tokens:
+        t = re.sub(re.escape(tok), "", t, flags=re.IGNORECASE)
     t = re.sub(r"^[\s,;:—\-–]+", "", t).strip()
     return t or "bez-temy"
 
