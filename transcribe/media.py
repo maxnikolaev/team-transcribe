@@ -24,23 +24,27 @@ def download_youtube_audio(url: str, out_dir: Path,
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
+    base = [
         sys.executable, "-m", "yt_dlp",
-        "-f", "bestaudio/best",
+        "--js-runtimes", "node",          # решает «n challenge» YouTube (нужен node + yt-dlp-ejs)
         "-x", "--audio-format", "mp3", "--audio-quality", "0",
         "--no-playlist", "--no-warnings",
         "-o", str(out_dir / "%(id)s.%(ext)s"),
         "--print", "after_move:filepath",
     ]
     if cookies_path and Path(cookies_path).exists():
-        cmd += ["--cookies", str(cookies_path)]
-    cmd.append(url)
+        base += ["--cookies", str(cookies_path)]
 
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-
-    if r.returncode != 0:
-        err = (r.stderr or "yt-dlp error").strip()
-        raise RuntimeError(err[-500:])
+    # Пробуем аудио-формат; при «format not available» — формат по умолчанию.
+    last_err = "yt-dlp error"
+    for fmt in (["bestaudio/best"], []):
+        cmd = base + (["-f"] + fmt if fmt else []) + [url]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        if r.returncode == 0:
+            break
+        last_err = (r.stderr or "yt-dlp error").strip()[-500:]
+    else:
+        raise RuntimeError(last_err)
 
     # yt-dlp печатает путь к итоговому файлу последней строкой stdout
     for line in reversed(r.stdout.strip().splitlines()):
