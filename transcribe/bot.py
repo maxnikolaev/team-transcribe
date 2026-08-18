@@ -22,7 +22,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
 from .config import get_settings
 from .deepgram_client import format_transcript, transcribe as transcribe_audio
 from .git_sync import commit_and_push
-from .media import download_youtube_audio, extract_audio
+from .media import audio_duration, download_youtube_audio, extract_audio
 from .metadata import CHANNEL_ALIASES, canonical_channel, parse_metadata, split_segments
 from .project_router import (accessible_projects, can_create_projects,
                              create_project, extract_topic, find_project)
@@ -34,6 +34,9 @@ router = Router()
 
 # Состояние ожидания: tg_id -> {audio_path, project_id, channel, participants, topic}
 _pending: dict[int, dict] = {}
+
+LONG_TRANSCRIPT_SEC = 15 * 60   # длиннее 15 минут — показываем прогресс
+PROGRESS_UPDATES = 3            # максимум промежуточных апдейтов (итого ≤ 4 сообщения)
 
 _YOUTUBE_RE = re.compile(
     r"(?:https?://)?(?:www\.|m\.)?"
@@ -106,6 +109,23 @@ def _cleanup(paths: list[str]) -> None:
             Path(p).unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _fmt_dur(sec: float) -> str:
+    """Форматирует секунды в читаемый вид: «2ч 03м», «5м 12с», «45с»."""
+    sec = max(int(sec), 0)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}ч {m:02d}м"
+    if m:
+        return f"{m}м {s:02d}с"
+    return f"{s}с"
+
+
+def _estimate_seconds(duration: float) -> float:
+    """Грубая оценка времени транскрибации (сек) по длительности аудио."""
+    return max(duration / 6.0, 30.0)
 
 
 def _next_missing(p: dict) -> str | None:
@@ -199,15 +219,46 @@ async def _process(bot: Bot, tg_id: int, p: dict) -> None:
     channel, participants, topic = p["channel"], p["participants"], p["topic"]
     audio = Path(p["audio_path"])
 
-    status = await bot.send_message(tg_id, f"⏳ Транскрибирую… ({project.name})")
+    duration = await asyncio.to_thread(audio_duration, audio)
+    long = duration is not None and duration > LONG_TRANSCRIPT_SEC
+    est = _estimate_seconds(duration) if duration is not None else 0.0
 
-    # 1) Транскрибация
-    try:
-        result = await asyncio.to_thread(
+    if long:
+        status = await bot.send_message(
+            tg_id,
+            f"⏳ Транскрибирую… ({project.name})\n"
+            f"Длительность: {_fmt_dur(duration or 0.0)}\n"
+            f"Ориентировочно займёт ~{_fmt_dur(est)}.",
+        )
+    else:
+        status = await bot.send_message(tg_id, f"⏳ Транскрибирую… ({project.name})")
+
+    # 1) Транскрибация (с прогрессом для длинных файлов)
+    task = asyncio.create_task(
+        asyncio.to_thread(
             transcribe_audio, audio, settings.deepgram_api_key,
             settings.deepgram_model, project.language or settings.deepgram_language,
             settings.deepgram_diarize, settings.deepgram_smart_format,
         )
+    )
+    started = time.time()
+    updates = 0
+    try:
+        if long:
+            interval = max(est / (PROGRESS_UPDATES + 1), 20.0)
+            while not task.done() and updates < PROGRESS_UPDATES:
+                await asyncio.sleep(interval)
+                if task.done():
+                    break
+                updates += 1
+                elapsed = time.time() - started
+                pct = min(int(elapsed / est * 100), 95)
+                await status.edit_text(
+                    f"⏳ Транскрибирую… ({project.name})\n"
+                    f"Прошло {_fmt_dur(elapsed)} · ≈{pct}% · "
+                    f"осталось ~{_fmt_dur(max(est - elapsed, 0))}"
+                )
+        result = await task
         markdown = format_transcript(result, settings.deepgram_diarize)
     except Exception as e:  # noqa: BLE001
         log.exception("transcribe failed")

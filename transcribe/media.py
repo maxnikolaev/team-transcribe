@@ -16,6 +16,20 @@ def extract_audio(src: Path, dst: Path) -> Path:
     return dst
 
 
+def audio_duration(path: Path) -> float | None:
+    """Длительность медиафайла в секундах (ffprobe). None, если не определить."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        val = (r.stdout or "").strip()
+        return float(val) if val else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def download_youtube_audio(url: str, out_dir: Path,
                            cookies_path: Path | None = None) -> Path:
     """Скачивает аудио с YouTube через yt-dlp (mp3). Возвращает путь к файлу.
