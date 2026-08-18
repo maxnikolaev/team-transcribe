@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import re
 import time
@@ -21,7 +22,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
 
 from .config import get_settings
 from .deepgram_client import format_transcript, transcribe as transcribe_audio
-from .git_sync import commit_and_push
+from .git_sync import commit_and_push, github_file_url
 from .media import audio_duration, download_youtube_audio, extract_audio
 from .metadata import CHANNEL_ALIASES, canonical_channel, parse_metadata, split_segments
 from .project_router import (accessible_projects, can_create_projects,
@@ -278,15 +279,24 @@ async def _process(bot: Bot, tg_id: int, p: dict) -> None:
         return
 
     # 3) Git commit + push
+    file_link = None
     try:
         commit = await asyncio.to_thread(
             commit_and_push, settings.git_repo_dir, saved["rel_paths"],
             saved["commit_msg"], settings.git_branch,
             settings.git_author_name, settings.git_author_email,
         )
-        await status.edit_text(
-            f"✅ Готово: <code>{saved['filename']}</code>\nCommit: <code>{commit}</code>"
-        )
+        file_link = github_file_url(settings.git_repo_url, settings.git_branch,
+                                    saved["rel_paths"][0])
+        if file_link:
+            await status.edit_text(
+                f"✅ Готово: <a href=\"{file_link}\">{html.escape(saved['filename'])}</a>\n"
+                f"Commit: <code>{commit}</code>\n{file_link}"
+            )
+        else:
+            await status.edit_text(
+                f"✅ Готово: <code>{saved['filename']}</code>\nCommit: <code>{commit}</code>"
+            )
     except Exception as e:  # noqa: BLE001
         log.exception("git failed")
         await status.edit_text(f"⚠️ Сохранено локально, но git не прошёл: {e}")
@@ -295,10 +305,10 @@ async def _process(bot: Bot, tg_id: int, p: dict) -> None:
     notify = project.notify_chat or settings.notify_chat_id
     if notify and int(notify) != tg_id:
         try:
-            await bot.send_message(
-                notify,
-                f"📝 {project.name}: «{topic}» ({channel}, {participants})"
-            )
+            txt = f"📝 {project.name}: «{topic}» ({channel}, {participants})"
+            if file_link:
+                txt += f"\n{file_link}"
+            await bot.send_message(notify, txt)
         except Exception as e:  # noqa: BLE001
             log.warning("notify failed: %s", e)
 

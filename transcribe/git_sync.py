@@ -2,10 +2,27 @@
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from pathlib import Path
+from urllib.parse import quote
 
 log = logging.getLogger("team-transcribe")
+
+_GITHUB_RE = re.compile(
+    r"(?:https?://|git@)github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
+
+
+def github_file_url(repo_url: str, branch: str, rel_path: str) -> str | None:
+    """Строит прямую https-ссылку на файл в GitHub (blob). None, если не GitHub."""
+    m = _GITHUB_RE.search((repo_url or "").strip())
+    if not m:
+        return None
+    owner_repo = m.group(1).rstrip("/")
+    quoted = quote(rel_path, safe="/")
+    return f"https://github.com/{owner_repo}/blob/{branch}/{quoted}"
 
 
 def _run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
