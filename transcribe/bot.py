@@ -62,6 +62,15 @@ def extract_link(text: str) -> str | None:
     return m.group(0) if m else None
 
 
+def _strip_urls(text: str) -> str:
+    """Убирает ссылки из подписи, чтобы URL не попадал в метаданные (канал/участники/тема)."""
+    t = _YOUTUBE_RE.sub(" ", text or "")
+    t = _YANDEX_DISK_RE.sub(" ", t)
+    t = re.sub(r"https?://\S+", " ", t)  # любые прочие http(s)-ссылки
+    t = re.sub(r"\s+", " ", t)
+    return t.strip(" ,;|—-")
+
+
 def _shared_cookies() -> Path | None:
     """Общий серверный cookies-файл (если есть). None — если файла нет."""
     p = get_settings().cookies_path
@@ -320,6 +329,7 @@ async def _start_processing(message: Message, audio_path: Path, meta_text: str) 
     settings = get_settings()
     tg_id = message.from_user.id
 
+    meta_text = _strip_urls(meta_text)  # ссылки не должны попадать в метаданные
     project = find_project(settings, tg_id, meta_text)
     project_id = project.id if project else None
     rest = extract_topic(meta_text, project) if project else meta_text
