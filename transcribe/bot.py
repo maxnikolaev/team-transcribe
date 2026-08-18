@@ -46,6 +46,18 @@ def extract_youtube_url(text: str) -> str | None:
     return m.group(0) if m else None
 
 
+_YANDEX_DISK_RE = re.compile(
+    r"(?:https?://)?disk\.yandex(?:\.ru|\.com)/(?:i|d)/[\w.-]+",
+    re.IGNORECASE,
+)
+
+
+def extract_link(text: str) -> str | None:
+    """Ссылка на видео: YouTube или Яндекс.Диск."""
+    m = _YOUTUBE_RE.search(text or "") or _YANDEX_DISK_RE.search(text or "")
+    return m.group(0) if m else None
+
+
 def _shared_cookies() -> Path | None:
     """Общий серверный cookies-файл (если есть). None — если файла нет."""
     p = get_settings().cookies_path
@@ -83,8 +95,17 @@ def _allowed(tg_id: int) -> bool:
 
 
 def _new_pending(audio_path: str) -> dict:
-    return {"audio_path": audio_path, "project_id": None, "channel": None,
-            "participants": None, "topic": None}
+    return {"audio_path": audio_path, "cleanup": [audio_path], "project_id": None,
+            "channel": None, "participants": None, "topic": None}
+
+
+def _cleanup(paths: list[str]) -> None:
+    """Удаляет временные медиафайлы, чтобы не захламлять сервер."""
+    for p in paths or []:
+        try:
+            Path(p).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _next_missing(p: dict) -> str | None:
@@ -192,6 +213,8 @@ async def _process(bot: Bot, tg_id: int, p: dict) -> None:
         log.exception("transcribe failed")
         await status.edit_text(f"❌ Ошибка транскрибации: {e}")
         return
+    finally:
+        _cleanup(p.get("cleanup", []))  # временный медиафайл больше не нужен
 
     # 2) Сохранение (только .md)
     try:
@@ -248,17 +271,17 @@ async def _start_processing(message: Message, audio_path: Path, meta_text: str) 
     await _advance(message.bot, tg_id)
 
 
-async def _handle_youtube(message: Message, url: str, meta_text: str,
-                          cookies: Path | None) -> None:
+async def _handle_link(message: Message, url: str, meta_text: str,
+                       cookies: Path | None) -> None:
     settings = get_settings()
     tg_id = message.from_user.id
-    status = await message.answer("⏬ Скачиваю аудио с YouTube…")
+    status = await message.answer("⏬ Скачиваю аудио…")
     try:
         audio = await asyncio.to_thread(
             download_youtube_audio, url, Path("downloads") / str(tg_id), cookies
         )
     except Exception as e:  # noqa: BLE001
-        log.exception("youtube download failed")
+        log.exception("download failed")
         if _needs_cookies(str(e)):
             await status.edit_text(
                 "❌ YouTube не отдаёт аудио без авторизации — cookies протухли "
@@ -288,7 +311,8 @@ async def on_start(message: Message):
         "Принимаю:\n"
         "• голосовое / аудиофайл\n"
         "• видеофайл (MP4) — извлеку звук\n"
-        "• ссылку на YouTube — скачаю аудио\n\n"
+        "• ссылку на YouTube — скачаю аудио\n"
+        "• ссылку на Яндекс.Диск (видео) — скачаю аудио\n\n"
         "Можно сразу всё одним сообщением:\n"
         "«Эрмитаж, телефон, Саша + Макс, обсуждение плана»\n"
         "Чего не хватит — спрошу отдельно.\n\n"
@@ -318,7 +342,8 @@ async def on_help(message: Message):
         "Что можно прислать:\n"
         "• голосовое или аудиофайл\n"
         "• видеофайл (MP4) — бот извлечёт звук\n"
-        "• ссылку на YouTube (текстом) — бот скачает аудио\n\n"
+        "• ссылку на YouTube (текстом) — бот скачает аудио\n"
+        "• ссылку на Яндекс.Диск (текстом) — бот скачает аудио\n\n"
         "Для YouTube с защитой: пришли cookies.txt файлом\n"
         "(файл .txt, затем ссылку — либо файл с подписью-ссылкой).\n\n"
         "В подписи можно указать всё сразу:\n"
@@ -366,6 +391,7 @@ async def on_video(message: Message):
         await _download(message.bot, message.video.file_id, dest)
         audio = dldir / f"{int(time.time())}.wav"
         await asyncio.to_thread(extract_audio, dest, audio)
+        dest.unlink(missing_ok=True)  # оригинал видео после извлечения не нужен
     except Exception as e:  # noqa: BLE001
         log.exception("video extract failed")
         await message.answer(f"❌ Не удалось извлечь аудио из видео: {e}")
@@ -409,7 +435,7 @@ async def on_document(message: Message):
     url = extract_youtube_url(caption)
     if url:
         await message.answer("Cookies обновлены ✓. Пробую скачать YouTube…")
-        await _handle_youtube(message, url, caption, cookies_path)
+        await _handle_link(message, url, caption, cookies_path)
     else:
         await message.answer("Cookies обновлены ✓. Теперь кинь ссылку на YouTube.")
 
@@ -426,7 +452,9 @@ async def on_project_choice(cb: CallbackQuery):
     pending = _pending.get(tg_id)
 
     if data == "__cancel__":
-        _pending.pop(tg_id, None)
+        p = _pending.pop(tg_id, None)
+        if p:
+            _cleanup(p.get("cleanup", []))
         await cb.message.edit_text("Отменено.")
         return
     if pending is None:
@@ -475,10 +503,11 @@ async def on_text(message: Message):
 
     text = message.text.strip()
 
-    # Ссылка на YouTube → новая задача
-    url = extract_youtube_url(text)
+    # Ссылка на видео (YouTube / Яндекс.Диск) → новая задача
+    url = extract_link(text)
     if url:
-        await _handle_youtube(message, url, text, _shared_cookies())
+        cookies = _shared_cookies() if _YOUTUBE_RE.search(url) else None
+        await _handle_link(message, url, text, cookies)
         return
 
     pending = _pending.get(tg_id)
